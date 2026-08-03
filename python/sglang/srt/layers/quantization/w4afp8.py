@@ -12,7 +12,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+from sglang.srt.layers.quantization.fp8 import Fp8KVCacheMethod, Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
@@ -82,12 +82,25 @@ class W4AFp8Config(QuantizationConfig):
         linear_activation_scheme = "dynamic"
         moe_activation_scheme = "static"
         weight_block_size = [128, 128]
+        ignored_layers = cls.get_from_keys_or(
+            config, ["ignore", "ignored_layers", "modules_to_not_convert"], None
+        )
+        if ignored_layers:
+            # Keep both "model." and non-"model." variants for robust prefix
+            # matching across model wrappers.
+            normalized = []
+            for layer in ignored_layers:
+                base = layer.removeprefix("model.")
+                normalized.append(base)
+                normalized.append(f"model.{base}")
+            ignored_layers = list(dict.fromkeys(normalized))
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             is_checkpoint_w4afp8_serialized=is_checkpoint_w4afp8_serialized,
             linear_activation_scheme=linear_activation_scheme,
             moe_activation_scheme=moe_activation_scheme,
             weight_block_size=weight_block_size,
+            ignored_layers=ignored_layers,
         )
 
     def get_quant_method(
@@ -95,6 +108,7 @@ class W4AFp8Config(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.radix_attention import RadixAttention
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.ignored_layers):
@@ -102,6 +116,8 @@ class W4AFp8Config(QuantizationConfig):
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
             return W4AFp8MoEMethod(self)
+        elif isinstance(layer, RadixAttention):
+            return Fp8KVCacheMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
