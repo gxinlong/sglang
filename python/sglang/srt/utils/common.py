@@ -91,7 +91,7 @@ from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
-from torchvision.io import decode_jpeg
+from torchvision.io import ImageReadMode, decode_jpeg
 from typing_extensions import Literal
 
 from sglang.srt.environ import envs
@@ -1665,7 +1665,9 @@ def _load_image(
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            image_tensor = decode_jpeg(encoded_image, device="cuda")
+            image_tensor = decode_jpeg(
+                encoded_image, mode=ImageReadMode.RGB, device="cuda"
+            )
             return image_tensor
         except Exception as e:
             logger.warning(
