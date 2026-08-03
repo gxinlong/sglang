@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import math
 import os
 import socket
 import threading
@@ -101,11 +102,61 @@ def load_kv_cache_scales(*, model, server_args: ServerArgs) -> None:
                     model.__class__,
                 )
         else:
-            logger.warning(
-                "Using FP8 KV cache but no scaling factors "
-                "provided. Defaulting to scaling factors of 1.0. "
-                "This may lead to less accurate results!"
-            )
+            embedded_scales = []
+            for module in model.modules():
+                k_scale = getattr(module, "k_scale", None)
+                v_scale = getattr(module, "v_scale", None)
+                if (
+                    isinstance(k_scale, torch.Tensor)
+                    and isinstance(v_scale, torch.Tensor)
+                    and k_scale.numel() == 1
+                    and v_scale.numel() == 1
+                ):
+                    embedded_scales.append(
+                        (
+                            float(k_scale.detach().item()),
+                            float(v_scale.detach().item()),
+                            bool(
+                                getattr(
+                                    module,
+                                    "_kv_cache_scales_loaded_from_checkpoint",
+                                    False,
+                                )
+                            ),
+                        )
+                    )
+
+            valid_scales = [
+                (k_scale, v_scale)
+                for k_scale, v_scale, loaded_from_checkpoint in embedded_scales
+                if (
+                    loaded_from_checkpoint
+                    and math.isfinite(k_scale)
+                    and math.isfinite(v_scale)
+                    and k_scale > 0.0
+                    and v_scale > 0.0
+                )
+            ]
+            if embedded_scales and len(valid_scales) == len(embedded_scales):
+                k_scales = [k_scale for k_scale, _ in valid_scales]
+                v_scales = [v_scale for _, v_scale in valid_scales]
+                logger.info(
+                    "Loaded embedded FP8 KV cache scales for %d attention layers "
+                    "(k=[%.6g, %.6g], v=[%.6g, %.6g]).",
+                    len(valid_scales),
+                    min(k_scales),
+                    max(k_scales),
+                    min(v_scales),
+                    max(v_scales),
+                )
+            else:
+                logger.warning(
+                    "Using FP8 KV cache but checkpoint scaling factors are "
+                    "missing or incomplete (%d/%d valid attention layers). "
+                    "Defaulting missing factors to 1.0; accuracy may degrade.",
+                    len(valid_scales),
+                    len(embedded_scales),
+                )
 
 
 def resolve_sliding_window_size(model, model_config: ModelConfig) -> Optional[int]:
