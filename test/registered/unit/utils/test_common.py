@@ -1,9 +1,12 @@
 import unittest
 from array import array
+from unittest.mock import patch
 
 import torch
+from torchvision.io import ImageReadMode
 
 from sglang.srt.utils.common import (
+    _load_image,
     flatten_arrays_to_int64_tensor,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
@@ -13,6 +16,23 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
+
+
+class TestLoadImage(CustomTestCase):
+    @patch("sglang.srt.utils.common.decode_jpeg")
+    @patch("sglang.srt.utils.common.is_jpeg_with_cuda", return_value=True)
+    def test_gpu_jpeg_decode_forces_rgb(self, _is_jpeg, mock_decode_jpeg):
+        expected = torch.zeros((3, 1, 1), dtype=torch.uint8)
+        mock_decode_jpeg.return_value = expected
+
+        result = _load_image(image_bytes=b"\xff\xd8\xff\xd9")
+
+        self.assertIs(result, expected)
+        mock_decode_jpeg.assert_called_once()
+        self.assertEqual(
+            mock_decode_jpeg.call_args.kwargs,
+            {"mode": ImageReadMode.RGB, "device": "cuda"},
+        )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
