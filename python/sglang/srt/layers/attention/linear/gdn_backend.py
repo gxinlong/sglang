@@ -675,6 +675,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_checkpoint_every_n_tokens=(
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
+                state_target_chunk_idx=forward_metadata.state_target_chunk_idx,
             )
 
             if is_npu() and last_recurrent_state is not None:

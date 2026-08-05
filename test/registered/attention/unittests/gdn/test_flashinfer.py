@@ -1,6 +1,8 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -10,6 +12,7 @@ from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from sglang.srt.layers.attention.linear.kernels import gdn_flashinfer
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
@@ -38,6 +41,102 @@ _sm_major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() e
 _supports_flashinfer_linear_gdn = _sm_major == 9 or (
     _sm_major == 10 and _cuda_major >= 13
 )
+
+
+class TestFlashInferGDNCheckpointPlan(unittest.TestCase):
+    def _make_inputs(self):
+        forward_batch = SimpleNamespace(
+            extend_seq_lens=torch.tensor([300, 300, 64], dtype=torch.int64),
+            mamba_track_mask=torch.tensor([True, True, False]),
+            mamba_track_seqlens=torch.tensor([257, 321, -1], dtype=torch.int64),
+            extend_prefix_lens=torch.tensor([0, 64, 0], dtype=torch.int64),
+        )
+        forward_metadata = SimpleNamespace(
+            track_ssm_h_src=torch.tensor([0, 1], dtype=torch.int64),
+            track_ssm_h_dst=torch.tensor([7, 8], dtype=torch.int64),
+            state_checkpoint_cu_starts=None,
+            num_state_checkpoints=0,
+            state_checkpoint_every_n_tokens=0,
+            state_target_chunk_idx=None,
+        )
+        return forward_batch, forward_metadata
+
+    def test_periodic_checkpoint_plan_is_preserved_when_disabled(self):
+        forward_batch, metadata = self._make_inputs()
+        args = SimpleNamespace(
+            mamba_cache_chunk_size=256,
+            enable_flashinfer_gdn_target_state=False,
+        )
+        with patch.object(gdn_flashinfer, "get_server_args", return_value=args):
+            gdn_flashinfer.maybe_build_flashinfer_checkpoint_plan(
+                forward_batch, metadata, "cpu"
+            )
+
+        self.assertEqual(metadata.track_ssm_h_src.tolist(), [0, 1])
+        self.assertEqual(metadata.state_checkpoint_cu_starts.tolist(), [0, 1, 2, 2])
+        self.assertEqual(metadata.num_state_checkpoints, 2)
+        self.assertEqual(metadata.state_checkpoint_every_n_tokens, 256)
+        self.assertIsNone(metadata.state_target_chunk_idx)
+
+    def test_target_only_plan_returns_one_sequence_indexed_slot(self):
+        forward_batch, metadata = self._make_inputs()
+        # The first requested boundary is before the first 256-token cache
+        # chunk, so target 0 must return the extend call's initial state.
+        forward_batch.mamba_track_seqlens[0] = 65
+        args = SimpleNamespace(
+            mamba_cache_chunk_size=256,
+            enable_flashinfer_gdn_target_state=True,
+        )
+        with patch.object(gdn_flashinfer, "get_server_args", return_value=args):
+            gdn_flashinfer.maybe_build_flashinfer_checkpoint_plan(
+                forward_batch, metadata, "cpu"
+            )
+
+        self.assertEqual(metadata.track_ssm_h_src.tolist(), [0, 1])
+        self.assertEqual(metadata.state_target_chunk_idx.tolist(), [0, 4, -1])
+        self.assertIsNone(metadata.state_checkpoint_cu_starts)
+        self.assertEqual(metadata.num_state_checkpoints, 0)
+
+
+class TestFlashInferGDNTargetDispatch(unittest.TestCase):
+    def test_target_mode_disables_cp_even_without_a_target_in_this_batch(self):
+        q = torch.ones(1, 2, 1, 2)
+        g = torch.zeros(1, 2, 1)
+        ssm_states = torch.zeros(2, 1, 2, 2)
+
+        for enabled in (False, True):
+            captured_kwargs = {}
+
+            def fake_prefill(**kwargs):
+                captured_kwargs.update(kwargs)
+                return kwargs["v"], kwargs["initial_state"]
+
+            kernel = object.__new__(gdn_flashinfer.FlashInferGDNKernel)
+            kernel.use_state_pool = False
+            kernel.use_target_state = enabled
+            kernel._prefill_fn = fake_prefill
+
+            with patch(
+                "sglang.kernels.ops.attention.fla.l2norm.l2norm_fwd",
+                side_effect=lambda tensor: tensor,
+            ):
+                kernel.extend(
+                    q=q,
+                    k=q,
+                    v=q,
+                    g=g,
+                    beta=g,
+                    ssm_states=ssm_states.clone(),
+                    cache_indices=torch.tensor([0]),
+                    query_start_loc=torch.tensor([0, 2]),
+                )
+
+            if enabled:
+                self.assertIs(captured_kwargs["use_cp"], False)
+            else:
+                self.assertNotIn("use_cp", captured_kwargs)
+            self.assertNotIn("output_intermediate_states", captured_kwargs)
+            self.assertNotIn("target_chunk_idx", captured_kwargs)
 
 
 @unittest.skipIf(

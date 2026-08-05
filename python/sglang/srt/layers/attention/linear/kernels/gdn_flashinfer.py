@@ -10,6 +10,7 @@ Requires flashinfer >= 0.6.14.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from typing import TYPE_CHECKING, Optional
@@ -37,31 +38,66 @@ _flashinfer_gated_delta_rule_mtp = None
 _flashinfer_gated_delta_rule_decode = None
 _flashinfer_gated_delta_rule_mtp_bf16 = None
 
+FLASHINFER_GDN_CHUNK_SIZE = 64
+
 
 def maybe_build_flashinfer_checkpoint_plan(
     forward_batch: ForwardBatch,
     forward_metadata: ForwardMetadata,
     device: str,
 ) -> None:
-    """Populate packed FlashInfer checkpoint metadata when tracking requires it."""
+    """Populate periodic or target-only FlashInfer checkpoint metadata."""
     if (
         forward_metadata.track_ssm_h_src is None
         or forward_metadata.track_ssm_h_src.numel() == 0
     ):
         return
 
-    checkpoint_every_n_tokens = get_server_args().mamba_cache_chunk_size
+    server_args = get_server_args()
+    checkpoint_every_n_tokens = server_args.mamba_cache_chunk_size
+    if checkpoint_every_n_tokens % FLASHINFER_GDN_CHUNK_SIZE != 0:
+        raise ValueError(
+            "mamba_cache_chunk_size must be divisible by FlashInfer's 64-token "
+            f"GDN chunk size, got {checkpoint_every_n_tokens}."
+        )
     extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
     track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
     relative_track_lens = forward_batch.mamba_track_seqlens.to(
         device="cpu", dtype=torch.int64
     ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
 
+    use_checkpoint = track_mask & (relative_track_lens % checkpoint_every_n_tokens != 0)
+
+    if server_args.enable_flashinfer_gdn_target_state:
+        target_token_lens = (
+            relative_track_lens[use_checkpoint] // checkpoint_every_n_tokens
+        ) * checkpoint_every_n_tokens
+        if target_token_lens.numel() and target_token_lens.min() < 0:
+            raise ValueError("Tracked GDN state precedes the initial FlashInfer state.")
+
+        target_chunk_idx = torch.full((track_mask.numel(),), -1, dtype=torch.int32)
+        target_chunk_idx[use_checkpoint] = (
+            target_token_lens // FLASHINFER_GDN_CHUNK_SIZE
+        ).to(torch.int32)
+
+        # The target-only output is sequence-indexed [batch, H, V, K]. Select
+        # exactly the rows whose intermediate state will be consumed.
+        forward_metadata.track_ssm_h_src = use_checkpoint.nonzero(as_tuple=True)[0].to(
+            device, non_blocking=True
+        )
+        assert (
+            forward_metadata.track_ssm_h_src.numel()
+            == forward_metadata.track_ssm_h_dst.numel()
+        )
+        forward_metadata.state_target_chunk_idx = target_chunk_idx.to(
+            device, non_blocking=True
+        )
+        return
+
     checkpoint_counts = extend_seq_lens // checkpoint_every_n_tokens
     checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)
     checkpoint_cu_starts[1:] = torch.cumsum(checkpoint_counts, dim=0)
 
-    use_checkpoint = track_mask & (relative_track_lens % checkpoint_every_n_tokens != 0)
     track_checkpoint_src = checkpoint_cu_starts[:-1][use_checkpoint] + (
         relative_track_lens[use_checkpoint] // checkpoint_every_n_tokens - 1
     )
@@ -168,6 +204,20 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         if self._mtp_fn is None:
             raise RuntimeError("FlashInfer GDN MTP (verify) kernel is unavailable.")
 
+        self.use_target_state = get_server_args().enable_flashinfer_gdn_target_state
+        if self.use_target_state:
+            prefill_parameters = inspect.signature(self._prefill_fn).parameters
+            missing_parameters = {
+                "output_intermediate_states",
+                "target_chunk_idx",
+            } - prefill_parameters.keys()
+            if missing_parameters:
+                raise RuntimeError(
+                    "--enable-flashinfer-gdn-target-state requires a FlashInfer "
+                    "build with target-state API support; missing parameters: "
+                    f"{sorted(missing_parameters)}."
+                )
+
         if self.use_state_pool and mtp_bf16_fn is not None:
             # Adapt bf16 kernel to fp32 kernel interface so target_verify needs no branching.
             def _mtp_bf16_adapted(
@@ -202,7 +252,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
             self._mtp_fn = _mtp_bf16_adapted
 
-        logger.info("Using FlashInfer GDN kernels")
+        logger.info(
+            "Using FlashInfer GDN kernels (target-state=%s)", self.use_target_state
+        )
 
     # ---- decode ----
 
@@ -284,6 +336,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         state_checkpoint_cu_starts: Optional[torch.Tensor] = None,
         num_state_checkpoints: int = 0,
         state_checkpoint_every_n_tokens: int = 0,
+        state_target_chunk_idx: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple:
         from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
@@ -327,7 +380,18 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if num_state_checkpoints > 0
             else None
         )
-        output_fi, output_state_fi = self._prefill_fn(
+        output_intermediate_states = (
+            initial_state_fi.new_empty(initial_state_fi.shape)
+            if state_target_chunk_idx is not None
+            else None
+        )
+        if output_intermediate_states is not None and state_checkpoints is not None:
+            raise ValueError(
+                "FlashInfer target-only states and periodic state checkpoints "
+                "must not be planned in the same SGLang forward."
+            )
+
+        prefill_kwargs = dict(
             q=q_fi,
             k=k_fi,
             v=v_fi,
@@ -343,6 +407,19 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             checkpoint_cu_starts=state_checkpoint_cu_starts,
             checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
         )
+        if self.use_target_state:
+            # The target-state API is implemented only by the non-CP SM90
+            # kernel. Keep every forward in an enabled server on that path,
+            # including warmup or aligned batches that emit no target state.
+            prefill_kwargs["use_cp"] = False
+        if output_intermediate_states is not None:
+            # Do not pass these keywords in the default mode, preserving runtime
+            # compatibility with stock FlashInfer builds that predate the API.
+            prefill_kwargs.update(
+                output_intermediate_states=output_intermediate_states,
+                target_chunk_idx=state_target_chunk_idx,
+            )
+        output_fi, output_state_fi = self._prefill_fn(**prefill_kwargs)
 
         # Write back state to pool
         ssm_states.index_copy_(
@@ -355,7 +432,16 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         core_attn_out = output_fi.view(1, total_seq_len, num_v_heads, head_v_dim)
 
         # Match Triton's [1, checkpoints, H, V, K] intermediate-state layout.
-        h = state_checkpoints.unsqueeze(0) if state_checkpoints is not None else None
+        intermediate_states = (
+            output_intermediate_states
+            if output_intermediate_states is not None
+            else state_checkpoints
+        )
+        h = (
+            intermediate_states.unsqueeze(0)
+            if intermediate_states is not None
+            else None
+        )
         return core_attn_out, None, h
 
     # ---- target_verify (MTP) ----

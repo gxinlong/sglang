@@ -2523,6 +2523,14 @@ class ServerArgs:
         ),
         NS("exec.mamba"),
     ] = None
+    enable_flashinfer_gdn_target_state: A[
+        bool,
+        "Use FlashInfer's target-only GDN prefill state output instead of "
+        "periodic packed checkpoints. Requires the FlashInfer prefill backend, "
+        "the Mamba extra-buffer radix-cache strategy, and an SM90 FlashInfer "
+        "build with target-state API support.",
+        NS("exec.mamba"),
+    ] = False
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot
     # ring + periodic flush to cut per-step HBM state traffic.
     enable_linear_replayssm: A[
@@ -6063,6 +6071,30 @@ class ServerArgs:
                 "--linear-attn-prefill-backend flashinfer on SM100+ requires CUDA 13+, "
                 f"got CUDA {cuda_version or 'unknown'}"
             )
+
+        if self.enable_flashinfer_gdn_target_state:
+            if prefill != "flashinfer":
+                raise ValueError(
+                    "--enable-flashinfer-gdn-target-state requires "
+                    "--linear-attn-prefill-backend flashinfer."
+                )
+            if not self.enable_mamba_extra_buffer():
+                raise ValueError(
+                    "--enable-flashinfer-gdn-target-state requires "
+                    "--mamba-radix-cache-strategy extra_buffer (or "
+                    "extra_buffer_lazy) with radix cache enabled."
+                )
+            if self.mamba_cache_chunk_size % 64 != 0:
+                raise ValueError(
+                    "--enable-flashinfer-gdn-target-state requires "
+                    "mamba_cache_chunk_size to be divisible by FlashInfer's "
+                    f"64-token GDN chunk size, got {self.mamba_cache_chunk_size}."
+                )
+            if is_cuda() and torch.cuda.get_device_capability()[0] != 9:
+                raise ValueError(
+                    "--enable-flashinfer-gdn-target-state currently supports "
+                    "only SM90 GPUs."
+                )
 
         # GDN ReplaySSM buffered decode guards. Runs on the Triton GDN decode
         # backend. cuda-graph is supported (slice 1b: CUDA-graph-safe static

@@ -58,6 +58,11 @@ class ForwardMetadata:
     state_checkpoint_cu_starts: Optional[torch.Tensor] = None
     num_state_checkpoints: int = 0
     state_checkpoint_every_n_tokens: int = 0
+    # FlashInfer target-only GDN checkpoint plan. One int32 chunk index per
+    # extend sequence; -1 means that sequence does not emit an intermediate
+    # state. The output row stays sequence-indexed so track_ssm_h_src can select
+    # the requested rows without materializing periodic checkpoints.
+    state_target_chunk_idx: Optional[torch.Tensor] = None
 
     is_target_verify: bool = False
     draft_token_num: int = 1
