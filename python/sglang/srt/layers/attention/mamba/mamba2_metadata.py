@@ -58,6 +58,9 @@ class ForwardMetadata:
     state_checkpoint_cu_starts: Optional[torch.Tensor] = None
     num_state_checkpoints: int = 0
     state_checkpoint_every_n_tokens: int = 0
+    # FlashInfer target-only checkpoint plan. Values are relative token
+    # boundaries in the current extend segment; -1 skips the sequence.
+    output_state_token_positions: Optional[torch.Tensor] = None
 
     is_target_verify: bool = False
     draft_token_num: int = 1

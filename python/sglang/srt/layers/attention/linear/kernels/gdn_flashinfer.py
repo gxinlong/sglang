@@ -10,6 +10,7 @@ Requires flashinfer >= 0.6.14.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from typing import TYPE_CHECKING, Optional
@@ -37,13 +38,17 @@ _flashinfer_gated_delta_rule_mtp = None
 _flashinfer_gated_delta_rule_decode = None
 _flashinfer_gated_delta_rule_mtp_bf16 = None
 
+FLASHINFER_GDN_CHUNK_SIZE = 64
+
 
 def maybe_build_flashinfer_checkpoint_plan(
     forward_batch: ForwardBatch,
     forward_metadata: ForwardMetadata,
     device: str,
+    *,
+    use_target_state: bool = False,
 ) -> None:
-    """Populate packed FlashInfer checkpoint metadata when tracking requires it."""
+    """Populate target-only or packed FlashInfer checkpoint metadata."""
     if (
         forward_metadata.track_ssm_h_src is None
         or forward_metadata.track_ssm_h_src.numel() == 0
@@ -51,17 +56,56 @@ def maybe_build_flashinfer_checkpoint_plan(
         return
 
     checkpoint_every_n_tokens = get_server_args().mamba_cache_chunk_size
+    if checkpoint_every_n_tokens % FLASHINFER_GDN_CHUNK_SIZE != 0:
+        raise ValueError(
+            "mamba_cache_chunk_size must be divisible by FlashInfer's 64-token "
+            f"GDN chunk size, got {checkpoint_every_n_tokens}."
+        )
     extend_seq_lens = forward_batch.extend_seq_lens.to(device="cpu", dtype=torch.int64)
     track_mask = forward_batch.mamba_track_mask.to(device="cpu", dtype=torch.bool)
     relative_track_lens = forward_batch.mamba_track_seqlens.to(
         device="cpu", dtype=torch.int64
     ) - forward_batch.extend_prefix_lens.to(device="cpu", dtype=torch.int64)
 
+    use_checkpoint = track_mask & (relative_track_lens % checkpoint_every_n_tokens != 0)
+
+    if use_target_state:
+        target_positions = (
+            relative_track_lens[use_checkpoint] // checkpoint_every_n_tokens
+        ) * checkpoint_every_n_tokens
+        if (
+            target_positions.numel()
+            and target_positions.min() < FLASHINFER_GDN_CHUNK_SIZE
+        ):
+            raise ValueError(
+                "Tracked GDN target state must follow at least one 64-token "
+                "FlashInfer chunk."
+            )
+
+        output_state_token_positions = torch.full(
+            (track_mask.numel(),), -1, dtype=torch.int32
+        )
+        output_state_token_positions[use_checkpoint] = target_positions.to(torch.int32)
+
+        # Target output is sequence-indexed [B, H, V, K]. Downstream therefore
+        # selects the batch rows that requested an intermediate state.
+        forward_metadata.track_ssm_h_src = use_checkpoint.nonzero(as_tuple=True)[0].to(
+            device, non_blocking=True
+        )
+        assert (
+            forward_metadata.track_ssm_h_src.numel()
+            == forward_metadata.track_ssm_h_dst.numel()
+        )
+        forward_metadata.output_state_token_positions = output_state_token_positions.to(
+            device, non_blocking=True
+        )
+        forward_metadata.num_state_checkpoints = track_mask.numel()
+        return
+
     checkpoint_counts = extend_seq_lens // checkpoint_every_n_tokens
     checkpoint_cu_starts = torch.zeros(checkpoint_counts.numel() + 1, dtype=torch.int64)
     checkpoint_cu_starts[1:] = torch.cumsum(checkpoint_counts, dim=0)
 
-    use_checkpoint = track_mask & (relative_track_lens % checkpoint_every_n_tokens != 0)
     track_checkpoint_src = checkpoint_cu_starts[:-1][use_checkpoint] + (
         relative_track_lens[use_checkpoint] // checkpoint_every_n_tokens - 1
     )
@@ -162,6 +206,13 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         sm_major = torch.cuda.get_device_capability()[0]
         self.use_state_pool = sm_major >= 10
         self.supports_target_verify = sm_major in (9, 10)
+        try:
+            prefill_parameters = inspect.signature(self._prefill_fn).parameters
+        except (TypeError, ValueError):
+            prefill_parameters = {}
+        self.supports_target_state = (
+            sm_major == 9 and "output_state_token_positions" in prefill_parameters
+        )
 
         if sm_major == 9 and self._prefill_fn is None:
             raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
@@ -202,7 +253,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
             self._mtp_fn = _mtp_bf16_adapted
 
-        logger.info("Using FlashInfer GDN kernels")
+        logger.info(
+            "Using FlashInfer GDN kernels (target-state=%s)",
+            self.supports_target_state,
+        )
 
     # ---- decode ----
 
@@ -284,6 +338,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         state_checkpoint_cu_starts: Optional[torch.Tensor] = None,
         num_state_checkpoints: int = 0,
         state_checkpoint_every_n_tokens: int = 0,
+        output_state_token_positions: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple:
         from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
@@ -327,7 +382,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             if num_state_checkpoints > 0
             else None
         )
-        output_fi, output_state_fi = self._prefill_fn(
+        prefill_kwargs = dict(
             q=q_fi,
             k=k_fi,
             v=v_fi,
@@ -343,6 +398,17 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             checkpoint_cu_starts=state_checkpoint_cu_starts,
             checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
         )
+        if output_state_token_positions is not None:
+            if not self.supports_target_state:
+                raise RuntimeError(
+                    "FlashInfer target-state metadata was planned, but the loaded "
+                    "SM90 prefill API does not support output_state_token_positions."
+                )
+            prefill_kwargs.update(
+                output_state_token_positions=output_state_token_positions,
+                use_cp=False,
+            )
+        output_fi, output_state_fi = self._prefill_fn(**prefill_kwargs)
 
         # Write back state to pool
         ssm_states.index_copy_(
