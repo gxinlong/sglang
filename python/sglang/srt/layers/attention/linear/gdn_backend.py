@@ -203,6 +203,10 @@ class GDNKernelDispatcher:
     def extend_uses_state_checkpoints(self) -> bool:
         return self.extend_kernel.uses_state_checkpoints
 
+    @property
+    def extend_supports_target_state(self) -> bool:
+        return self.extend_kernel.supports_target_state
+
     def packed_decode(
         self,
         mixed_qkv: torch.Tensor,
@@ -367,7 +371,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
                 maybe_build_flashinfer_checkpoint_plan(
-                    forward_batch, self.forward_metadata, self.device
+                    forward_batch,
+                    self.forward_metadata,
+                    self.device,
+                    use_target_state=(
+                        self.kernel_dispatcher.extend_supports_target_state
+                    ),
                 )
 
     def forward_decode(
@@ -674,6 +683,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 num_state_checkpoints=forward_metadata.num_state_checkpoints,
                 state_checkpoint_every_n_tokens=(
                     forward_metadata.state_checkpoint_every_n_tokens
+                ),
+                output_state_token_positions=(
+                    forward_metadata.output_state_token_positions
                 ),
             )
 

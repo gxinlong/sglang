@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNKernelDispatcher,
     flashinfer_gdn_prefill_default,
 )
+from sglang.srt.layers.attention.linear.kernels import gdn_flashinfer
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     maybe_build_flashinfer_checkpoint_plan,
 )
@@ -166,10 +167,119 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
         self.assertEqual(metadata.num_state_checkpoints, 7)
         self.assertEqual(metadata.state_checkpoint_every_n_tokens, 64)
 
+    def test_builds_sequence_indexed_target_state_plan(self):
+        forward_batch = SimpleNamespace(
+            extend_seq_lens=torch.tensor([63, 64, 65, 127, 128, 129]),
+            mamba_track_mask=torch.tensor([False, True, True, True, True, True]),
+            # The 65 on the 128-token request encodes an internal S64 branch.
+            mamba_track_seqlens=torch.tensor([63, 64, 65, 127, 65, 129]),
+            extend_prefix_lens=torch.zeros(6, dtype=torch.int64),
+        )
+        metadata = SimpleNamespace(
+            track_ssm_h_src=torch.empty(4),
+            track_ssm_h_dst=torch.empty(4),
+            output_state_token_positions=None,
+            num_state_checkpoints=0,
+        )
+
+        with patch.object(
+            gdn_flashinfer,
+            "get_server_args",
+            return_value=SimpleNamespace(mamba_cache_chunk_size=64),
+        ):
+            maybe_build_flashinfer_checkpoint_plan(
+                forward_batch,
+                metadata,
+                "cpu",
+                use_target_state=True,
+            )
+
+        torch.testing.assert_close(
+            metadata.output_state_token_positions,
+            torch.tensor([-1, -1, 64, 64, 64, 128], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            metadata.track_ssm_h_src,
+            torch.tensor([2, 3, 4, 5]),
+        )
+        self.assertEqual(metadata.num_state_checkpoints, 6)
+
+    def test_target_state_plan_rejects_initial_state_target(self):
+        forward_batch = SimpleNamespace(
+            extend_seq_lens=torch.tensor([63]),
+            mamba_track_mask=torch.tensor([True]),
+            mamba_track_seqlens=torch.tensor([63]),
+            extend_prefix_lens=torch.zeros(1, dtype=torch.int64),
+        )
+        metadata = SimpleNamespace(
+            track_ssm_h_src=torch.empty(1),
+            track_ssm_h_dst=torch.empty(1),
+        )
+
+        with (
+            patch.object(
+                gdn_flashinfer,
+                "get_server_args",
+                return_value=SimpleNamespace(mamba_cache_chunk_size=64),
+            ),
+            self.assertRaisesRegex(ValueError, "at least one 64-token"),
+        ):
+            maybe_build_flashinfer_checkpoint_plan(
+                forward_batch,
+                metadata,
+                "cpu",
+                use_target_state=True,
+            )
+
+    def test_target_state_dispatch_allocates_one_row_per_sequence(self):
+        captured_kwargs = {}
+
+        def fake_prefill(**kwargs):
+            captured_kwargs.update(kwargs)
+            return kwargs["v"], kwargs["output_state"]
+
+        kernel = object.__new__(gdn_flashinfer.FlashInferGDNKernel)
+        kernel.use_state_pool = False
+        kernel.supports_target_state = True
+        kernel._prefill_fn = fake_prefill
+
+        q = torch.ones(1, 2, 1, 2)
+        g = torch.zeros(1, 2, 1)
+        ssm_states = torch.zeros(2, 1, 2, 2)
+        output_positions = torch.tensor([0], dtype=torch.int32)
+
+        with patch(
+            "sglang.kernels.ops.attention.fla.l2norm.l2norm_fwd",
+            side_effect=lambda tensor: tensor,
+        ):
+            _, _, h = kernel.extend(
+                q=q,
+                k=q,
+                v=q,
+                g=g,
+                beta=g,
+                ssm_states=ssm_states,
+                cache_indices=torch.tensor([0]),
+                query_start_loc=torch.tensor([0, 2]),
+                num_state_checkpoints=1,
+                output_state_token_positions=output_positions,
+            )
+
+        self.assertEqual(tuple(h.shape), (1, 1, 1, 2, 2))
+        self.assertEqual(
+            tuple(captured_kwargs["state_checkpoints"].shape),
+            (1, 1, 2, 2),
+        )
+        self.assertIs(captured_kwargs["output_state_token_positions"], output_positions)
+        self.assertIs(captured_kwargs["use_cp"], False)
+
     def test_decode_tracking_without_h_source_skips_checkpoint_plan(self):
         backend = object.__new__(GDNAttnBackend)
         backend.device = "cpu"
-        backend.kernel_dispatcher = SimpleNamespace(extend_uses_state_checkpoints=True)
+        backend.kernel_dispatcher = SimpleNamespace(
+            extend_uses_state_checkpoints=True,
+            extend_supports_target_state=False,
+        )
         metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
         forward_batch = SimpleNamespace(
             mamba_track_mask=torch.tensor([True]),
