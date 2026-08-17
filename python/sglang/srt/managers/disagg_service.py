@@ -19,6 +19,12 @@ def start_disagg_service(
     transfer_backend = TransferBackend(server_args.disaggregation_transfer_backend)
 
     if disagg_mode == DisaggregationMode.PREFILL:
+        # The fake backend is a process-local sink used to exercise the prefill
+        # disaggregation lifecycle without a decode peer. It has no bootstrap
+        # server class and must not bind a bootstrap port.
+        if transfer_backend == TransferBackend.FAKE:
+            return None
+
         # only start bootstrap server on prefill tm
         kv_bootstrap_server_class = get_kv_class(
             transfer_backend, KVClassType.BOOTSTRAP_SERVER
