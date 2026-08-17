@@ -98,11 +98,12 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             server_args.disaggregation_decode_extra_slots = extra_slots
 
     elif server_args.disaggregation_mode == "prefill":
-        assert (
-            server_args.disaggregation_transfer_backend != "fake"
-        ), "Prefill server does not support 'fake' as the transfer backend"
-
-        if envs.SGLANG_RUST_SERVER.get():
+        if server_args.disaggregation_transfer_backend == "fake":
+            logger.warning(
+                "PD prefill is using the fake transfer backend: KV/state transfer "
+                "will complete locally without a decode peer or bootstrap server."
+            )
+        elif envs.SGLANG_RUST_SERVER.get():
             _alias_bootstrap_port_to_api_port(server_args)
 
     if server_args.disaggregation_mode in ("prefill", "decode"):

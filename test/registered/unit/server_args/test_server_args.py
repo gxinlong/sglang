@@ -269,6 +269,24 @@ class TestLoadBalanceMethod(unittest.TestCase):
             server_args._handle_pd_disaggregation()
         self.assertIn("without improving prefill performance", "\n".join(logs.output))
 
+    def test_pd_prefill_allows_fake_without_bootstrap_alias(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="prefill",
+            disaggregation_transfer_backend="fake",
+        )
+
+        with (
+            envs.SGLANG_RUST_SERVER.override(True),
+            patch.object(pd_disaggregation_hook, "_alias_bootstrap_port_to_api_port")
+            as mock_alias,
+            self.assertLogs(pd_disaggregation_hook.logger, level="WARNING") as logs,
+        ):
+            server_args._handle_pd_disaggregation()
+
+        mock_alias.assert_not_called()
+        self.assertIn("without a decode peer", "\n".join(logs.output))
+
     def test_pd_decode_dcp_forces_chunk_cache(self):
         server_args = self._load_balance_args(
             disaggregation_mode="decode",
