@@ -908,6 +908,9 @@ class Envs:
     # Overlap Spec V2
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
+    # Overlap Qwen shared-expert compute with the DeepEP routed-expert path.
+    SGLANG_ENABLE_SHARED_EXPERT_OVERLAP = EnvBool(False)
+
     # Spec Config
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
