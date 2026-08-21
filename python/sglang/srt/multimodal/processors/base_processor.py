@@ -181,6 +181,9 @@ class BaseMultimodalProcessor(ABC):
     gpu_image_decode = True  # Enable GPU decoding by default
     prefer_tokenized_input = False
     precompute_hash_before_cpu_transfer = False
+    # Processors must opt in after they plumb preloaded images through their
+    # processor-specific data path.
+    supports_ttft_parallel_image_preload = False
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
     preserve_processor_input_ids = False
@@ -906,6 +909,7 @@ class BaseMultimodalProcessor(ABC):
         return_text: Optional[bool] = True,
         discard_alpha_channel: bool = True,
         audio_sample_rate: Optional[int] = None,
+        _preloaded_images: Optional[list] = None,
     ) -> BaseMultiModalProcessorOutput:
 
         BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
@@ -975,6 +979,7 @@ class BaseMultimodalProcessor(ABC):
             discard_alpha_channel=discard_alpha_channel,
             audio_sample_rate=audio_sample_rate,
             input_ids=input_ids,
+            _preloaded_images=_preloaded_images,
         )
 
     async def fast_load_mm_data(
@@ -988,6 +993,7 @@ class BaseMultimodalProcessor(ABC):
         discard_alpha_channel: bool = True,
         audio_sample_rate: Optional[int] = None,
         input_ids: Optional[Union[List[int], torch.Tensor]] = None,
+        _preloaded_images: Optional[list] = None,
     ) -> BaseMultiModalProcessorOutput:
         """
         A fast version of `load_mm_data` that loads multimodal data directly.
@@ -1010,10 +1016,11 @@ class BaseMultimodalProcessor(ABC):
         futures: List[Tuple[Modality, int, concurrent.futures.Future]] = []
 
         modalities_data = [
-            (image_data, Modality.IMAGE),
             (video_data, Modality.VIDEO),
             (audio_data, Modality.AUDIO),
         ]
+        if _preloaded_images is None:
+            modalities_data.insert(0, (image_data, Modality.IMAGE))
 
         for data_list, modality in modalities_data:
             futures.extend(
@@ -1024,7 +1031,16 @@ class BaseMultimodalProcessor(ABC):
 
         logger.debug("[load_mm_data(simple)] total futures submitted: %d", len(futures))
 
-        images: List[Any] = [None] * len(image_data) if image_data else []
+        if _preloaded_images is not None:
+            expected_images = len(image_data) if image_data else 0
+            if len(_preloaded_images) != expected_images:
+                raise ValueError(
+                    "The number of preloaded images does not match image_data: "
+                    f"{len(_preloaded_images)} != {expected_images}"
+                )
+            images = list(_preloaded_images)
+        else:
+            images: List[Any] = [None] * len(image_data) if image_data else []
         videos: List[Any] = [None] * len(video_data) if video_data else []
         audios: List[Any] = [None] * len(audio_data) if audio_data else []
 
@@ -1073,6 +1089,35 @@ class BaseMultimodalProcessor(ABC):
             input_text=prompt_str,
             input_ids=input_ids,
         )
+
+    async def load_images_only_async(
+        self,
+        image_data: Optional[list] = None,
+        discard_alpha_channel: bool = True,
+    ) -> List[Any]:
+        """Load images early so text tokenization can run in parallel."""
+        if not image_data:
+            return []
+
+        futures = self._submit_mm_data_loading_tasks_simple(
+            image_data,
+            Modality.IMAGE,
+            audio_sample_rate=None,
+            discard_alpha_channel=discard_alpha_channel,
+        )
+        images: List[Any] = [None] * len(image_data)
+        for _, idx, future in futures:
+            try:
+                images[idx] = await asyncio.wrap_future(future)
+            except ValueError as e:
+                raise ValueError(
+                    f"An exception occurred while loading IMAGE data at index {idx}: {e}"
+                ) from e
+            except Exception as e:
+                raise RuntimeError(
+                    f"An exception occurred while loading IMAGE data at index {idx}: {e}"
+                ) from e
+        return images
 
     async def legacy_load_mm_data(
         self,
