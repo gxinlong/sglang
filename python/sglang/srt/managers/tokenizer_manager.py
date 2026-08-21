@@ -983,6 +983,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         input_embeds = None
         input_text = obj.text
         token_type_ids = None
+        parallel_image_load_future = None
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
@@ -1011,9 +1012,38 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Use empty placeholder - multimodal processor will override
                 input_ids = []
             else:
-                input_ids, token_type_ids = await self._tokenize_texts(
-                    input_text, is_cross_encoder_request
-                )
+                if (
+                    envs.SGLANG_ENABLE_TTFT_PARALLEL.get()
+                    and self.mm_processor is not None
+                    and obj.contains_mm_input()
+                    and not self.server_args.language_only
+                    and getattr(
+                        self.mm_processor,
+                        "supports_ttft_parallel_image_preload",
+                        False,
+                    )
+                ):
+                    if obj.image_data is not None and not isinstance(obj.image_data, list):
+                        obj.image_data = [obj.image_data]
+                    if obj.video_data is not None and not isinstance(obj.video_data, list):
+                        obj.video_data = [obj.video_data]
+                    if obj.audio_data is not None and not isinstance(obj.audio_data, list):
+                        obj.audio_data = [obj.audio_data]
+                    self._validate_mm_limits(obj)
+                    parallel_image_load_future = asyncio.ensure_future(
+                        self.mm_processor.load_images_only_async(obj.image_data)
+                    )
+                try:
+                    input_ids, token_type_ids = await self._tokenize_texts(
+                        input_text, is_cross_encoder_request
+                    )
+                except Exception:
+                    if (
+                        parallel_image_load_future is not None
+                        and not parallel_image_load_future.done()
+                    ):
+                        parallel_image_load_future.cancel()
+                    raise
 
         contains_mm_input = obj.contains_mm_input()
         is_mossvl = (
@@ -1031,7 +1061,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.video_data = [obj.video_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
-            if contains_mm_input:
+            if contains_mm_input and parallel_image_load_future is None:
                 self._validate_mm_limits(obj)
 
             mm_inputs = None
@@ -1061,12 +1091,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
                         )
+                    preloaded_images = (
+                        await parallel_image_load_future
+                        if parallel_image_load_future is not None
+                        else None
+                    )
                     mm_inputs = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,
                         audio_data=obj.audio_data,
                         input_text=mm_processor_input,
                         request_obj=obj,
                         max_req_input_len=self.max_req_input_len,
+                        _preloaded_images=preloaded_images,
                     )
             elif (
                 self.server_args.language_only
