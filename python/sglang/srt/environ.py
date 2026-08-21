@@ -946,6 +946,9 @@ class Envs:
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
+    # Overlap local image loading with text tokenization for Qwen-VL requests.
+    # This is opt-in because it adds concurrent CPU/I/O work per request.
+    SGLANG_ENABLE_TTFT_PARALLEL = EnvBool(False)
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
