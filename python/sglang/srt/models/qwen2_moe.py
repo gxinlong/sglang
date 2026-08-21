@@ -92,7 +92,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -465,10 +470,26 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             and forward_batch.forward_mode.is_cuda_graph()
         )
         shared_output = None
+        shared_event = None
+        enable_cuda_shared_expert_overlap = (
+            _is_cuda
+            and get_server_args().enable_shared_expert_overlap
+            and self.shared_expert is not None
+            and self.alt_stream is not None
+        )
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits, _ = self.gate(hidden_states)
-            if enable_dual_stream:
+            if enable_cuda_shared_expert_overlap:
+                # Keep DeepEP dispatch/combine on the current stream while the
+                # independent shared expert runs on the reusable alt stream.
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self._forward_shared_experts(hidden_states)
+                    shared_output.record_stream(self.alt_stream)
+                    shared_event = self.alt_stream.record_event()
+            elif enable_dual_stream:
                 shared_output = shared_expert_on_independent_stream(
                     hidden_states.clone(), self._forward_shared_experts
                 )
@@ -492,6 +513,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             hidden_states=hidden_states,
             topk_output=topk_output,
         )
+        if shared_event is not None:
+            torch.cuda.current_stream().wait_event(shared_event)
         if enable_dual_stream:
             wait_share_stream()
 
