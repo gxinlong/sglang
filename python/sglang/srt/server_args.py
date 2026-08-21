@@ -2863,6 +2863,12 @@ class ServerArgs:
         "Let computation and communication overlap within one micro batch.",
         NS("exec.overlap"),
     ] = False
+    enable_shared_expert_overlap: A[
+        bool,
+        "Overlap Qwen shared-expert compute with the DeepEP routed-expert path. "
+        "Experimental and disabled by default.",
+        NS("exec.overlap"),
+    ] = False
     tbo_token_distribution_threshold: A[
         float,
         "The threshold of token distribution between two batches in micro-batch-overlap, determines whether to two-batch-overlap or two-chunk-overlap. Set to 0 denote disable two-chunk-overlap.",
@@ -3462,6 +3468,7 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._handle_shared_expert_overlap()
         self._handle_return_hidden_states_mode()
         if self.model_path.lower() in ["none", "dummy"]:
             return
@@ -5947,6 +5954,10 @@ class ServerArgs:
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
+
+    def _handle_shared_expert_overlap(self):
+        if envs.SGLANG_ENABLE_SHARED_EXPERT_OVERLAP.get():
+            self.enable_shared_expert_overlap = True
 
     def _handle_mamba_backend(self):
         if self.mamba_cache_philox_rounds < 0:
