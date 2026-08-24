@@ -282,6 +282,7 @@ async def preprocess_video(
 
 # Compatible with Qwen-VL & Qwen-Omni Series
 class QwenVLImageProcessor(SGLangBaseProcessor):
+    supports_ttft_parallel_image_preload = True
     supports_transformers_backend = True
     models = [
         Qwen2VLForConditionalGeneration,
@@ -723,12 +724,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         entry_time = time.perf_counter()
+        preloaded_images = kwargs.pop("_preloaded_images", None)
         base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data,
             audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
+            _preloaded_images=preloaded_images,
         )
         load_time = time.perf_counter()
         rid = getattr(request_obj, "rid", "anonymous_rid")
